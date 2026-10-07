@@ -641,6 +641,7 @@ dependencies = [
 name = "confidential-balance-sync"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "litesvm",
  "solana-address 2.6.1",
  "solana-instruction",
@@ -648,6 +649,7 @@ dependencies = [
  "solana-signer",
  "solana-system-interface",
  "solana-transaction",
+ "solana-transaction-error",
  "solana-zk-sdk 7.0.1",
  "spl-token-2022-interface",
  "spl-token-confidential-transfer-proof-extraction",

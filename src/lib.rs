@@ -5,6 +5,7 @@
 //! and returns instructions. Nothing sends a transaction, so it drops into a
 //! custody pipeline that signs and submits on its own.
 
+use curve25519_dalek::traits::IsIdentity;
 use solana_address::Address;
 use solana_instruction::Instruction;
 
@@ -32,9 +33,15 @@ pub enum SyncError {
     Extension(TokenError),
     Deserialize,
     AesDecrypt,
-    /// The residual exceeded the 2^32 discrete-log window. Fall back to a
-    /// bounded candidate search or to replaying history.
+    Overflow,
+    /// The residual exceeded the 2^32 discrete-log window. Confirm a candidate
+    /// with `available_matches`.
     ResidualOutOfRange { aes_view: u64 },
+    /// `pending_balance_hi` exceeded the 2^32 discrete-log window. Confirm a
+    /// candidate with `pending_matches`.
+    PendingOutOfRange,
+    /// A supplied balance does not match the on-chain ciphertext.
+    CandidateMismatch,
 }
 
 /// Result of comparing the AES view against the on-chain ElGamal balance.
@@ -43,12 +50,24 @@ pub enum SyncStatus {
     /// The two agree. `available` is spendable.
     InSync { available: u64 },
     /// An apply landed with a stale view. `truth` is the real available
-    /// balance; write it back with `correction_instruction`.
+    /// balance; `spendable_balance` spends against it and `apply_instruction`
+    /// writes it back.
     Stale {
         aes_view: u64,
         missed: u64,
         truth: u64,
     },
+}
+
+/// What the credit counters say about the most recent apply.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CounterGap {
+    /// The counters match. Conclusive only with one apply in flight per account.
+    Clean,
+    /// The last apply swept in this many credits its client never read.
+    Missed(u64),
+    /// The last apply carried a counter read before another apply reset it.
+    Inverted { expected: u64, actual: u64 },
 }
 
 fn confidential_state<'a>(
@@ -57,6 +76,44 @@ fn confidential_state<'a>(
     state
         .get_extension::<ConfidentialTransferAccount>()
         .map_err(|_| SyncError::Extension(TokenError::ExtensionNotFound))
+}
+
+fn ciphertexts(
+    account_data: &[u8],
+) -> Result<(ElGamalCiphertext, ElGamalCiphertext, AeCiphertext, u64), SyncError> {
+    let state = StateWithExtensions::<Account>::unpack(account_data)
+        .map_err(|_| SyncError::Deserialize)?;
+    let ct = confidential_state(&state)?;
+
+    let available: ElGamalCiphertext = ct
+        .available_balance
+        .try_into()
+        .map_err(|_| SyncError::Deserialize)?;
+    let pending_lo: ElGamalCiphertext = ct
+        .pending_balance_lo
+        .try_into()
+        .map_err(|_| SyncError::Deserialize)?;
+    let pending_hi: ElGamalCiphertext = ct
+        .pending_balance_hi
+        .try_into()
+        .map_err(|_| SyncError::Deserialize)?;
+    let decryptable: AeCiphertext = ct
+        .decryptable_available_balance
+        .try_into()
+        .map_err(|_| SyncError::Deserialize)?;
+
+    let pending = pending_lo + pending_hi * (1u64 << PENDING_BALANCE_LO_BIT_LENGTH);
+    Ok((
+        available,
+        pending,
+        decryptable,
+        u64::from(ct.pending_balance_credit_counter),
+    ))
+}
+
+/// True if `ciphertext` encrypts zero under `secret`, whatever its randomness.
+pub fn encrypts_zero(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> bool {
+    secret.decrypt(ciphertext).target.is_identity()
 }
 
 /// The authoritative check.
@@ -74,19 +131,7 @@ pub fn check_sync(
     elgamal_secret: &ElGamalSecretKey,
     aes_key: &AeKey,
 ) -> Result<SyncStatus, SyncError> {
-    let state = StateWithExtensions::<Account>::unpack(account_data)
-        .map_err(|_| SyncError::Deserialize)?;
-    let ct = confidential_state(&state)?;
-
-    let available: ElGamalCiphertext = ct
-        .available_balance
-        .try_into()
-        .map_err(|_| SyncError::Deserialize)?;
-    let decryptable: AeCiphertext = ct
-        .decryptable_available_balance
-        .try_into()
-        .map_err(|_| SyncError::Deserialize)?;
-
+    let (available, _, decryptable, _) = ciphertexts(account_data)?;
     let aes_view = aes_key.decrypt(&decryptable).ok_or(SyncError::AesDecrypt)?;
 
     let residual = available.subtract_amount(aes_view);
@@ -102,36 +147,58 @@ pub fn check_sync(
         SyncStatus::Stale {
             aes_view,
             missed,
-            truth: aes_view
-                .checked_add(missed)
-                .ok_or(SyncError::ResidualOutOfRange { aes_view })?,
+            truth: aes_view.checked_add(missed).ok_or(SyncError::Overflow)?,
         }
     })
 }
 
+/// Confirms a candidate available balance, for when `check_sync` returns
+/// `ResidualOutOfRange`. One subtraction and one scalar multiplication.
+pub fn available_matches(
+    account_data: &[u8],
+    elgamal_secret: &ElGamalSecretKey,
+    candidate: u64,
+) -> Result<bool, SyncError> {
+    let (available, _, _, _) = ciphertexts(account_data)?;
+    Ok(encrypts_zero(
+        elgamal_secret,
+        &available.subtract_amount(candidate),
+    ))
+}
+
+/// Confirms a candidate pending balance, for when `pending_balance_hi` is past
+/// the discrete-log window. Check it before applying, while pending is still
+/// separate from available.
+pub fn pending_matches(
+    account_data: &[u8],
+    elgamal_secret: &ElGamalSecretKey,
+    candidate: u64,
+) -> Result<bool, SyncError> {
+    let (_, pending, _, _) = ciphertexts(account_data)?;
+    Ok(encrypts_zero(elgamal_secret, &pending.subtract_amount(candidate)))
+}
+
 /// The cheap pre-filter.
 ///
-/// `Some(n)` means the last apply missed `n` credits. `Some(0)` means the last
-/// apply was clean. Only conclusive when one apply is in flight per account at
-/// a time; a concurrent apply overwrites both counters and can report zero over
-/// a balance an earlier apply already left stale. Treat this as a hint and
-/// `check_sync` as the answer.
-pub fn counter_gap(account_data: &[u8]) -> Result<u64, SyncError> {
+/// Reconcile on anything but `Clean`. `Clean` is only conclusive with one apply in flight per account.
+pub fn counter_gap(account_data: &[u8]) -> Result<CounterGap, SyncError> {
     let state = StateWithExtensions::<Account>::unpack(account_data)
         .map_err(|_| SyncError::Deserialize)?;
     let ct = confidential_state(&state)?;
 
     let expected = u64::from(ct.expected_pending_balance_credit_counter);
     let actual = u64::from(ct.actual_pending_balance_credit_counter);
-    // saturating: a concurrent apply can leave actual below expected
-    Ok(actual.saturating_sub(expected))
+    Ok(match actual.checked_sub(expected) {
+        Some(0) => CounterGap::Clean,
+        Some(missed) => CounterGap::Missed(missed),
+        None => CounterGap::Inverted { expected, actual },
+    })
 }
 
 /// Builds `ApplyPendingBalance` against the state you just read.
 ///
-/// Returns the instruction and the available balance it will produce if nothing
-/// credits the account before it lands. Check that prediction with `check_sync`
-/// after the transaction confirms; do not assume it.
+/// Writes true available plus pending to the AES balance, so every apply also repairs a stale cache.
+/// Returns the instruction and the expected resulting balance; confirm it with `check_sync`.
 pub fn apply_instruction(
     token_program_id: &Address,
     account: &Address,
@@ -141,6 +208,53 @@ pub fn apply_instruction(
     elgamal_secret: &ElGamalSecretKey,
     aes_key: &AeKey,
 ) -> Result<(Instruction, u64), SyncError> {
+    let (available, _) = spendable_balance(account_data, elgamal_secret, aes_key)?;
+    let pending = decrypt_pending(account_data, elgamal_secret)?;
+    build_apply(
+        token_program_id,
+        account,
+        authority,
+        multisig_signers,
+        account_data,
+        aes_key,
+        available,
+        pending,
+    )
+}
+
+/// `apply_instruction` for balances recovered elsewhere (deposit records,
+/// history) when a discrete log is out of range. Both are checked against the
+/// ciphertexts first.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with_balances(
+    token_program_id: &Address,
+    account: &Address,
+    authority: &Address,
+    multisig_signers: &[&Address],
+    account_data: &[u8],
+    elgamal_secret: &ElGamalSecretKey,
+    aes_key: &AeKey,
+    available: u64,
+    pending: u64,
+) -> Result<(Instruction, u64), SyncError> {
+    if !available_matches(account_data, elgamal_secret, available)?
+        || !pending_matches(account_data, elgamal_secret, pending)?
+    {
+        return Err(SyncError::CandidateMismatch);
+    }
+    build_apply(
+        token_program_id,
+        account,
+        authority,
+        multisig_signers,
+        account_data,
+        aes_key,
+        available,
+        pending,
+    )
+}
+
+fn decrypt_pending(account_data: &[u8], elgamal_secret: &ElGamalSecretKey) -> Result<u64, SyncError> {
     let state = StateWithExtensions::<Account>::unpack(account_data)
         .map_err(|_| SyncError::Deserialize)?;
     let ct = confidential_state(&state)?;
@@ -153,32 +267,33 @@ pub fn apply_instruction(
         .pending_balance_hi
         .try_into()
         .map_err(|_| SyncError::Deserialize)?;
-    let decryptable: AeCiphertext = ct
-        .decryptable_available_balance
-        .try_into()
-        .map_err(|_| SyncError::Deserialize)?;
 
     let lo = elgamal_secret
         .decrypt_u32(&pending_lo)
-        .ok_or(SyncError::ResidualOutOfRange { aes_view: 0 })?;
+        .ok_or(SyncError::PendingOutOfRange)?;
     let hi = elgamal_secret
         .decrypt_u32(&pending_hi)
-        .ok_or(SyncError::ResidualOutOfRange { aes_view: 0 })?;
+        .ok_or(SyncError::PendingOutOfRange)?;
 
-    // (hi << 16) + lo. Both operands came from decrypt_u32 so hi is at most
-    // 2^32-1 and the shift cannot drop bits.
-    //
-    // Do not reach for try_combine_lo_hi_u64 in the proof-generation crate. It
-    // is deprecated and adds amount_hi to itself instead of amount_lo.
-    let pending = hi
-        .checked_shl(PENDING_BALANCE_LO_BIT_LENGTH)
+    // try_combine_lo_hi_u64 in proof-generation is buggy (adds hi to itself).
+    hi.checked_shl(PENDING_BALANCE_LO_BIT_LENGTH)
         .and_then(|shifted| shifted.checked_add(lo))
-        .ok_or(SyncError::Deserialize)?;
+        .ok_or(SyncError::Overflow)
+}
 
-    let current = aes_key.decrypt(&decryptable).ok_or(SyncError::AesDecrypt)?;
-    let new_available = current.checked_add(pending).ok_or(SyncError::Deserialize)?;
-
-    let expected_counter = u64::from(ct.pending_balance_credit_counter);
+#[allow(clippy::too_many_arguments)]
+fn build_apply(
+    token_program_id: &Address,
+    account: &Address,
+    authority: &Address,
+    multisig_signers: &[&Address],
+    account_data: &[u8],
+    aes_key: &AeKey,
+    available: u64,
+    pending: u64,
+) -> Result<(Instruction, u64), SyncError> {
+    let (_, _, _, expected_counter) = ciphertexts(account_data)?;
+    let new_available = available.checked_add(pending).ok_or(SyncError::Overflow)?;
     let ix = apply_pending_balance(
         token_program_id,
         account,
@@ -188,7 +303,6 @@ pub fn apply_instruction(
         multisig_signers,
     )
     .map_err(|_| SyncError::Deserialize)?;
-
     Ok((ix, new_available))
 }
 
@@ -201,9 +315,7 @@ pub fn apply_instruction(
 /// balance the client feeds into proof generation, and that is recoverable from
 /// the ElGamal ciphertext whenever the cached field has gone stale.
 ///
-/// So a stale AES view never has to block a send and never needs a repair
-/// transaction first. Resolve the balance, build the transfer against it, and
-/// the transfer writes a correct AES value back as a side effect.
+/// Only as fresh as `account_data`: an apply landing first fails the spend, so re-read and rebuild.
 ///
 /// Pass the returned ciphertext as `current_decryptable_available_balance` to
 /// `transfer_split_proof_data`.
@@ -212,50 +324,17 @@ pub fn spendable_balance(
     elgamal_secret: &ElGamalSecretKey,
     aes_key: &AeKey,
 ) -> Result<(u64, AeCiphertext), SyncError> {
-    match check_sync(account_data, elgamal_secret, aes_key)? {
-        // Cache agrees with the chain; reuse it as-is.
-        SyncStatus::InSync { available } => Ok((available, aes_key.encrypt(available))),
-        // Cache is behind. Build a ciphertext over the real balance instead.
-        SyncStatus::Stale { truth, .. } => Ok((truth, aes_key.encrypt(truth))),
-    }
-}
-
-/// Writes a corrected AES balance back as a standalone transaction.
-///
-/// Usually unnecessary. `spendable_balance` lets a stale cache heal on the next
-/// transfer at no extra cost, so reach for this only when you want the stored
-/// field correct without waiting for a send, for example so a monitoring system
-/// reading the account sees the right number.
-///
-/// There is no dedicated instruction for it. `ApplyPendingBalance` has no guard
-/// requiring a non-zero pending balance, so an apply with nothing pending is a
-/// no-op on the ElGamal side and overwrites the AES ciphertext.
-pub fn correction_instruction(
-    token_program_id: &Address,
-    account: &Address,
-    authority: &Address,
-    multisig_signers: &[&Address],
-    account_data: &[u8],
-    truth: u64,
-    aes_key: &AeKey,
-) -> Result<Instruction, SyncError> {
-    let state = StateWithExtensions::<Account>::unpack(account_data)
-        .map_err(|_| SyncError::Deserialize)?;
-    let ct = confidential_state(&state)?;
-
-    apply_pending_balance(
-        token_program_id,
-        account,
-        u64::from(ct.pending_balance_credit_counter),
-        &aes_key.encrypt(truth).into(),
-        authority,
-        multisig_signers,
-    )
-    .map_err(|_| SyncError::Deserialize)
+    let available = match check_sync(account_data, elgamal_secret, aes_key)? {
+        SyncStatus::InSync { available } => available,
+        SyncStatus::Stale { truth, .. } => truth,
+    };
+    Ok((available, aes_key.encrypt(available)))
 }
 
 /// Step one of a fenced sweep: shut the account to inbound confidential credits
 /// so the read that follows is stable.
+///
+/// Blocks every credit to the confidential balances. Plain transfers still land in the public `amount`.
 ///
 /// Not the default, and not the answer to the race. While this is in force the
 /// account rejects every inbound confidential transfer, including legitimate
@@ -266,9 +345,8 @@ pub fn correction_instruction(
 ///
 /// The one case that justifies it: the account routinely receives more than
 /// 2^32 base units inside a single read-to-apply window, which puts the residual
-/// past the discrete-log ceiling, and neither a bounded search against expected
-/// deposits nor replaying history is available. Fencing makes that residual
-/// impossible instead of merely usually small.
+/// past the discrete-log ceiling, and neither a candidate check against expected
+/// deposits nor replaying history is available.
 ///
 /// Send this and wait for confirmation before reading. Folding it into the same
 /// transaction as the apply does nothing, because the race is between the read
@@ -351,6 +429,22 @@ mod tests {
 
         let residual = keypair.pubkey().encrypt(balance).subtract_amount(balance);
         assert_eq!(keypair.secret().decrypt_u32(&residual).unwrap(), 0);
+    }
+
+    /// A residual keeps the ciphertext's randomness, so it never equals a fresh
+    /// zero ciphertext; the zero check has to go through the secret key.
+    #[test]
+    fn candidate_check_needs_the_secret_not_byte_equality() {
+        let keypair = ElGamalKeypair::new_rand();
+        let balance: u64 = 1 << 40;
+        let residual = keypair.pubkey().encrypt(balance).subtract_amount(balance);
+
+        assert_ne!(residual, keypair.pubkey().encrypt(0u64));
+        assert_ne!(residual, ElGamalCiphertext::default());
+        assert!(encrypts_zero(keypair.secret(), &residual));
+
+        let wrong = keypair.pubkey().encrypt(balance).subtract_amount(balance - 1);
+        assert!(!encrypts_zero(keypair.secret(), &wrong));
     }
 
     /// Pins the lo/hi layout the apply path depends on, and the widest values
